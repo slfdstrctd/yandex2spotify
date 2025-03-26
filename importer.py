@@ -3,6 +3,7 @@ import argparse
 import logging
 from base64 import b64encode
 from time import sleep
+from datetime import datetime
 
 import spotipy
 from PIL import Image
@@ -123,12 +124,13 @@ class Importer:
 
         return found_items[0]['id']
 
-    def _add_items_to_spotify(self, items, not_imported_section, save_items_callback):
+    def _add_items_to_spotify(self, items, not_imported_section, save_items_callback, api_method, playlist_id=None):
         spotify_items = []
-
-        items.reverse()
+        
+        # Process items to get Spotify IDs while maintaining order
         for item in items:
-            if item.available:
+            # if True:
+            if not item.available: # process hidden tracks
                 try:
                     spotify_id = self._import_item(item)
                     if spotify_id is None:
@@ -136,36 +138,74 @@ class Importer:
                         continue
                     spotify_items.append(spotify_id)
                     logger.info('OK')
-
                 except NotFoundException as exception:
                     not_imported_section.append(exception.item_name)
                     logger.warning('NO')
                 except SpotifyException:
-                    not_imported_section.append(item.title)
+                    not_imported_section.append(item.title if hasattr(item, 'title') else str(item))
                     logger.warning('NO')
 
         if not spotify_items:
             logger.info('No valid Spotify items to add.')
             return
-
-        for chunk in chunks(spotify_items, 50):
-            save_items_callback(self, chunk)
-
-
+        
+        logger.info(f"Adding {len(spotify_items)} items one by one with sleep timeout...")
+        
+        # Process tracks one by one
+        for i, item_id in enumerate(spotify_items):
+            logger.info(f"Adding item {i+1}/{len(spotify_items)}: {item_id}")
+            
+            try:
+                if api_method == "tracks":
+                    handle_spotify_exception(self.spotify_client.current_user_saved_tracks_add)([item_id])
+                elif api_method == "playlist_tracks":
+                    # Add at the end of the playlist, one by one
+                    handle_spotify_exception(self.spotify_client.user_playlist_add_tracks)(
+                        self.user, 
+                        playlist_id, 
+                        [item_id]
+                    )
+                elif api_method == "albums":
+                    handle_spotify_exception(self.spotify_client.current_user_saved_albums_add)([item_id])
+                elif api_method == "artists":
+                    handle_spotify_exception(self.spotify_client.user_follow_artists)([item_id])
+                
+                logger.info(f"Item {i+1} successfully added")
+                
+                # Add sleep timeout between requests to avoid rate limiting and ensure proper ordering
+                sleep(1)  # 1 second timeout between adding tracks
+                
+            except Exception as e:
+                logger.error(f"Error adding item {item_id}: {str(e)}")
+                not_imported_section.append(item_id)
 
     def import_likes(self):
         self.not_imported['Likes'] = []
 
+        # Get all liked tracks
         likes_tracks = self.yandex_client.users_likes_tracks().tracks
-        tracks = self.yandex_client.tracks([f'{track.id}:{track.album_id}' for track in likes_tracks if track.album_id])
-        logger.info('Importing liked tracks...')
-
-        def save_tracks_callback(importer, spotify_tracks):
-            logger.info(f'Saving {len(spotify_tracks)} tracks...')
-            handle_spotify_exception(importer.spotify_client.current_user_saved_tracks_add)(spotify_tracks)
-            logger.info('OK')
-
-        self._add_items_to_spotify(tracks, self.not_imported['Likes'], save_tracks_callback)
+        
+        # Sort by timestamp (oldest first)
+        if likes_tracks and hasattr(likes_tracks[0], 'timestamp'):
+            logger.info("Sorting liked tracks by timestamp (oldest first)...")
+            likes_tracks.sort(key=lambda x: x.timestamp if hasattr(x, 'timestamp') else 0)
+            
+            # Log the sorted order
+            for i, track in enumerate(likes_tracks[:5]):
+                logger.info(f"Track {i}: {track.id} - Timestamp: {track.timestamp if hasattr(track, 'timestamp') else 'N/A'}")
+            
+            if len(likes_tracks) > 5:
+                logger.info(f"... and {len(likes_tracks) - 5} more tracks")
+        
+        # Get track IDs in the sorted order
+        track_ids = [f'{track.id}:{track.album_id}' for track in likes_tracks if track.album_id]
+        
+        # Fetch full track details
+        tracks = self.yandex_client.tracks(track_ids)
+        logger.info(f'Importing {len(tracks)} liked tracks in chronological order...')
+        
+        # Now add them to Spotify in the same order
+        self._add_items_to_spotify(tracks, self.not_imported['Likes'], None, "tracks")
 
     def import_playlists(self):
         playlists = self.yandex_client.users_playlists_list()
@@ -175,7 +215,7 @@ class Importer:
 
             logger.info(f'Importing playlist {playlist.title}...')
 
-            if playlist.cover.type == 'pic':
+            if playlist.cover and hasattr(playlist.cover, 'type') and playlist.cover.type == 'pic':
                 filename = f'{playlist.kind}-cover'
                 playlist.cover.download(filename, size='400x400')
 
@@ -183,50 +223,105 @@ class Importer:
 
             self.not_imported[playlist.title] = []
 
+            # Fetch playlist tracks
+            logger.info(f"Fetching tracks for playlist: {playlist.title}")
             playlist_tracks = playlist.fetch_tracks()
+            
+            # Sort by timestamp if can
+            if playlist_tracks and hasattr(playlist_tracks[0], 'timestamp'):
+                logger.info(f"Sorting {len(playlist_tracks)} playlist tracks by timestamp (oldest first)...")
+                playlist_tracks.sort(key=lambda x: x.timestamp if hasattr(x, 'timestamp') else 0)
+                
+                # Log the first few tracks to verify order
+                for i, track in enumerate(playlist_tracks[:5]):
+                    logger.info(f"Track {i}: ID {track.track_id} - Timestamp: {track.timestamp if hasattr(track, 'timestamp') else 'N/A'}")
+                
+                if len(playlist_tracks) > 5:
+                    logger.info(f"... and {len(playlist_tracks) - 5} more tracks")
+            
+            # Process track data based on playlist type
             if not playlist.collective:
-                tracks = [track.track for track in playlist_tracks]
+                # For regular playlists
+                tracks = []
+                for track_info in playlist_tracks:
+                    if hasattr(track_info, 'track') and track_info.track:
+                        tracks.append(track_info.track)
+                    else:
+                        logger.warning(f"Missing track data for track in playlist {playlist.title}")
             elif playlist.collective and playlist_tracks:
-                tracks = self.yandex_client.tracks([track.track_id for track in playlist_tracks])
+                # For collective playlists, maintain the order after sorting
+                track_ids = [track.track_id for track in playlist_tracks]
+                
+                # Log the order of track IDs
+                logger.info(f"Fetching tracks in this order: {track_ids[:5]}... (and {len(track_ids)-5} more)")
+                
+                # Fetch all tracks at once
+                all_tracks = self.yandex_client.tracks(track_ids)
+                
+                # Create a map of tracks by ID
+                tracks_map = {str(track.id): track for track in all_tracks}
+                
+                # Rebuild the tracks list in the original (sorted) order
+                tracks = []
+                for track_id in track_ids:
+                    track = tracks_map.get(str(track_id))
+                    if track:
+                        tracks.append(track)
+                    else:
+                        logger.warning(f"Could not find track with ID {track_id} in fetched tracks")
             else:
                 tracks = []
 
-            def save_tracks_callback(importer, spotify_tracks):
-                logger.info(f'Saving {len(spotify_tracks)} tracks in playlist {playlist.title}...')
-                handle_spotify_exception(importer.spotify_client.user_playlist_add_tracks)(importer.user,
-                                                                                           spotify_playlist_id,
-                                                                                           spotify_tracks)
-                logger.info('OK')
-
-            self._add_items_to_spotify(tracks, self.not_imported[playlist.title], save_tracks_callback)
+            logger.info(f'Processing {len(tracks)} tracks for playlist {playlist.title}')
+            
+            # Add tracks to Spotify playlist in the correct order
+            self._add_items_to_spotify(tracks, self.not_imported[playlist.title], None, "playlist_tracks", spotify_playlist_id)
 
     def import_albums(self):
         self.not_imported['Albums'] = []
 
         likes_albums = self.yandex_client.users_likes_albums()
-        albums = [album.album for album in likes_albums]
-        logger.info('Importing albums...')
-
-        def save_albums_callback(importer, spotify_albums):
-            logger.info(f'Saving {len(spotify_albums)} albums...')
-            handle_spotify_exception(importer.spotify_client.current_user_saved_albums_add)(spotify_albums)
-            logger.info('OK')
-
-        self._add_items_to_spotify(albums, self.not_imported['Albums'], save_albums_callback)
+        
+        # Sort albums by timestamp (oldest first)
+        if likes_albums and hasattr(likes_albums[0], 'timestamp'):
+            logger.info("Sorting albums by timestamp (oldest first)...")
+            likes_albums.sort(key=lambda x: x.timestamp if hasattr(x, 'timestamp') else 0)
+            
+            # Log the sorted order
+            for i, album in enumerate(likes_albums[:5]):
+                logger.info(f"Album {i}: {album.album.id if hasattr(album, 'album') else 'N/A'} - Timestamp: {album.timestamp if hasattr(album, 'timestamp') else 'N/A'}")
+            
+            if len(likes_albums) > 5:
+                logger.info(f"... and {len(likes_albums) - 5} more albums")
+        
+        albums = [album.album for album in likes_albums if hasattr(album, 'album')]
+        logger.info(f'Importing {len(albums)} albums in chronological order...')
+        
+        # Add to Spotify in the correct order
+        self._add_items_to_spotify(albums, self.not_imported['Albums'], None, "albums")
 
     def import_artists(self):
         self.not_imported['Artists'] = []
 
         likes_artists = self.yandex_client.users_likes_artists()
-        artists = [artist.artist for artist in likes_artists]
-        logger.info('Importing artists...')
-
-        def save_artists_callback(importer, spotify_artists):
-            logger.info(f'Saving {len(spotify_artists)} artists...')
-            handle_spotify_exception(importer.spotify_client.user_follow_artists)(spotify_artists)
-            logger.info('OK')
-
-        self._add_items_to_spotify(artists, self.not_imported['Artists'], save_artists_callback)
+        
+        # Sort artists by timestamp if can
+        if likes_artists and hasattr(likes_artists[0], 'timestamp'):
+            logger.info("Sorting artists by timestamp (oldest first)...")
+            likes_artists.sort(key=lambda x: x.timestamp if hasattr(x, 'timestamp') else 0)
+            
+            # Log the sorted order
+            for i, artist in enumerate(likes_artists[:5]):
+                logger.info(f"Artist {i}: {artist.artist.id if hasattr(artist, 'artist') else 'N/A'} - Timestamp: {artist.timestamp if hasattr(artist, 'timestamp') else 'N/A'}")
+            
+            if len(likes_artists) > 5:
+                logger.info(f"... and {len(likes_artists) - 5} more artists")
+        
+        artists = [artist.artist for artist in likes_artists if hasattr(artist, 'artist')]
+        logger.info(f'Importing {len(artists)} artists in chronological order...')
+        
+        # Add to Spotify in the correct order
+        self._add_items_to_spotify(artists, self.not_imported['Artists'], None, "artists")
 
     def import_all(self):
         for item in self._importing_items.values():
@@ -245,9 +340,22 @@ class Importer:
         with open(file_path, 'r', encoding='UTF-8') as file:
             tracks = json.load(file)
 
+        # If the JSON file has timestamps, sort by those
+        if tracks and 'timestamp' in tracks[0]:
+            logger.info("Sorting JSON tracks by timestamp (oldest first)...")
+            tracks.sort(key=lambda x: x.get('timestamp', 0))
+            
+            # Log the sorted order
+            for i, track in enumerate(tracks[:5]):
+                logger.info(f"Track {i}: {track.get('artist', 'Unknown')} - {track.get('track', 'Unknown')} - Timestamp: {track.get('timestamp', 'N/A')}")
+            
+            if len(tracks) > 5:
+                logger.info(f"... and {len(tracks) - 5} more tracks")
+
         spotify_tracks = []
         not_imported = []
 
+        # Process tracks in order
         for track in tracks:
             query = f'{track["artist"]} {track["track"]}'
 
@@ -265,12 +373,18 @@ class Importer:
         # Create a new playlist
         playlist_name = 'Imported from JSON'
         playlist = handle_spotify_exception(self.spotify_client.user_playlist_create)(self.user, playlist_name)
-
-        # Add tracks to the new playlist
-        for chunk in chunks(spotify_tracks, 50):
-            logger.info(f'Saving {len(chunk)} tracks...')
-            handle_spotify_exception(self.spotify_client.user_playlist_add_tracks)(self.user, playlist['id'], chunk)
-            logger.info('OK')
+        playlist_id = playlist['id']
+        
+        logger.info(f"Created playlist '{playlist_name}' with ID {playlist_id}")
+        
+        # Add tracks to the new playlist in chunks, but maintain order
+        chunks_list = list(chunks(spotify_tracks, 50))
+        logger.info(f"Processing {len(chunks_list)} chunks of tracks for JSON import")
+        
+        for i, chunk in enumerate(chunks_list):
+            logger.info(f"Adding chunk {i+1}/{len(chunks_list)} with {len(chunk)} tracks to playlist")
+            handle_spotify_exception(self.spotify_client.user_playlist_add_tracks)(self.user, playlist_id, chunk)
+            logger.info(f"Chunk {i+1} successfully added")
 
         logger.error('Not imported tracks:')
         for track in not_imported:
@@ -292,7 +406,7 @@ if __name__ == '__main__':
 
     parser.add_argument('-T', '--timeout', help='Request timeout for spotify', type=float, default=10)
 
-    parser.add_argument('-S', '--strict-artists-search', help='Search for an exact match of all artists', default=False)
+    parser.add_argument('-S', '--strict-artists-search', help='Search for an exact match of all artists', action='store_true')
 
     parser.add_argument('-j', '--json-path', help='JSON file to import tracks from')
 
